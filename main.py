@@ -1,459 +1,197 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+import os
 import uuid
 from datetime import datetime
-import json
-import os
+from typing import Optional, Any, List
 
-from pydantic import BaseModel
-from PIL import Image
-import imagehash
-from io import BytesIO
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-from starlette.responses import StreamingResponse
+# ==========================================================
+# ① ここに Supabase API を差し込む（.env から読む）
+# ==========================================================
 
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+SUPABASE_URL = os.getenv("SUPABASE_URL")  # https://cquygugcndkkvxxpsgwi.supabase.co
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNxdXlndWdjbmRra3Z4eHBzZ3dpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDc1NjY0NSwiZXhwIjoyMDgwMzMyNjQ1fQ.t5UNLecCHF6Q_GdB81s2tRLyyI4BufgLSNGF31el6ko
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY が設定されていません (.env を確認してください)")
+
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+def supabase_table_url(table: str):
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+# ==========================================================
+# ② Pydantic モデル（jobs の構造）
+# ==========================================================
+
+class JobBase(BaseModel):
+    job_name: str
+    customer_name: Optional[str] = None
+    address: Optional[str] = None
+    work_date: Optional[str] = None
+    work_time: Optional[str] = None
+    price_total: Optional[float] = None
+    truck_type: Optional[str] = None
+    workers: Optional[int] = None
+    notes: Optional[str] = None
+    total_volume_m3: Optional[float] = None
+    ai_result: Optional[Any] = None
+
+
+class Job(JobBase):
+    job_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobUpdate(BaseModel):
+    job_name: Optional[str] = None
+    customer_name: Optional[str] = None
+    address: Optional[str] = None
+    work_date: Optional[str] = None
+    work_time: Optional[str] = None
+    price_total: Optional[float] = None
+    truck_type: Optional[str] = None
+    workers: Optional[int] = None
+    notes: Optional[str] = None
+    total_volume_m3: Optional[float] = None
+    ai_result: Optional[Any] = None
+
+
+class VolumeEstimateRequest(JobBase):
+    pass
+
+
+class VolumeEstimateResponse(BaseModel):
+    job: Job
+    message: str = "ok"
+
+
+# ==========================================================
+# ③ FastAPI 初期化
+# ==========================================================
 
 app = FastAPI()
 
-# ==========================
-# CORS設定（フロントのRyu兵衛から叩けるように）
-# ==========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 慣れてきたら Vercel のドメインだけに絞ってOK
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==========================
-# 設定値など
-# ==========================
 
-# 画像の重複判定のしきい値（0〜64くらい）
-DUP_HASH_THRESHOLD = 5
+# ==========================================================
+# ④ Supabase 操作（SELECT / INSERT / UPDATE）
+# ==========================================================
 
-# 案件データを保存するファイル名（JSON）
-JOBS_FILE = "jobs.json"
+TABLE = "jobs"
 
-# メモリ上の案件データ（起動中ずっと保持）
-# job_id -> dict
-jobs = {}
+def supabase_insert_job(data: dict) -> Job:
+    url = supabase_table_url(TABLE)
+    now = datetime.utcnow().isoformat()
 
+    payload = [{
+        "job_id": data.get("job_id", str(uuid.uuid4())),
+        "created_at": now,
+        "updated_at": now,
+        **data
+    }]
 
-def load_jobs_from_file():
-    """サーバー起動時に jobs.json から読み込む"""
-    global jobs
-    if os.path.exists(JOBS_FILE):
-        try:
-            with open(JOBS_FILE, "r", encoding="utf-8") as f:
-                jobs = json.load(f)
-        except Exception:
-            jobs = {}
-    else:
-        jobs = {}
+    res = requests.post(url, headers=supabase_headers(), json=payload)
+    if not res.ok:
+        raise HTTPException(500, f"Supabase insert error: {res.text}")
+
+    return Job(**res.json()[0])
 
 
-def save_jobs_to_file():
-    """案件データを jobs.json に保存"""
-    try:
-        with open(JOBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(jobs, f, ensure_ascii=False, indent=2)
-    except Exception:
-        # 本番ではログに出したりしてもよいが、今は軽く無視
-        pass
+def supabase_select_job(job_id: str) -> Job:
+    url = supabase_table_url(TABLE)
+    params = {"job_id": f"eq.{job_id}", "select": "*"}
+    res = requests.get(url, headers=supabase_headers(), params=params)
+
+    if not res.ok:
+        raise HTTPException(500, f"Supabase select error: {res.text}")
+
+    data = res.json()
+    if not data:
+        raise HTTPException(404, "job not found")
+
+    return Job(**data[0])
 
 
-# 起動時に一度だけ読み込む
-load_jobs_from_file()
+def supabase_select_jobs() -> List[Job]:
+    url = supabase_table_url(TABLE)
+    params = {"select": "*", "order": "created_at.desc"}
+    res = requests.get(url, headers=supabase_headers(), params=params)
 
-# ==========================
-# 日本語フォントの登録
-# ==========================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FONT_NAME = "JP"
+    if not res.ok:
+        raise HTTPException(500, f"Supabase select error: {res.text}")
 
-FONT_CANDIDATES = [
-    os.path.join(BASE_DIR, "fonts", "ipaexg.ttf"),  # 通常はここ
-    os.path.join(BASE_DIR, "ipaexg.ttf"),           # 保険：直下に置いた場合
-]
-
-font_path = None
-for p in FONT_CANDIDATES:
-    if os.path.exists(p):
-        font_path = p
-        break
-
-if font_path is None:
-    # ここで止まってくれた方が「フォントが無い！」とすぐ気づける
-    raise RuntimeError(
-        "ipaexg.ttf が見つかりません。リポジトリ直下か fonts/ フォルダに配置してください。"
-    )
-
-pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
+    return [Job(**item) for item in res.json()]
 
 
-# ==========================
-# Pydantic モデル
-# ==========================
+def supabase_update_job(job_id: str, data: dict) -> Job:
+    url = supabase_table_url(TABLE)
+    data["updated_at"] = datetime.utcnow().isoformat()
 
-class JobUpdate(BaseModel):
-    """ユーザーが後から編集できる項目だけを定義"""
+    params = {"job_id": f"eq.{job_id}", "select": "*"}
+    res = requests.patch(url, headers=supabase_headers(), params=params, json=data)
 
-    job_name: Optional[str] = None        # 現場名
-    customer_name: Optional[str] = None   # お客様名
-    address: Optional[str] = None         # 住所
-    work_date: Optional[str] = None       # 作業日
-    work_time: Optional[str] = None       # 作業時間帯
-    price_total: Optional[float] = None   # 見積金額（税込）
-    truck_type: Optional[str] = None      # 使用トラック種別
-    workers: Optional[int] = None         # 作業員人数
-    notes: Optional[str] = None           # 備考
+    if not res.ok:
+        raise HTTPException(500, f"Supabase update error: {res.text}")
+
+    return Job(**res.json()[0])
 
 
-# ==========================
-# 画像の重複判定（角度違いをまとめる）
-# ==========================
+# ==========================================================
+# ⑤ API エンドポイント
+# ==========================================================
 
-async def deduplicate_images(files: List[UploadFile]):
+@app.post("/v1/volume-estimate", response_model=VolumeEstimateResponse)
+def create_and_estimate(payload: VolumeEstimateRequest):
     """
-    角度違い・ほぼ同じ構図の画像をまとめて1枚扱いにする。
-    - imagehash の pHash（知覚ハッシュ）で類似度を見て、
-      しきい値以下なら「重複」と判断して弾く。
+    ここに現在の AI 立米計算ロジックを移植してください。
+    ↓ この3つを埋めて Supabase 保存
+    - total_volume_m3
+    - price_total
+    - ai_result
     """
-    unique_files: List[UploadFile] = []
-    hashes = []
-    kept_names = []
-    all_names = [f.filename for f in files]
-
-    for f in files:
-        # UploadFile からバイト列を取り出す
-        content = await f.read()
-
-        try:
-            img = Image.open(BytesIO(content))
-        except Exception:
-            # 画像として読めなければスキップ
-            continue
-
-        # pHash を計算
-        h = imagehash.phash(img)
-
-        # すでにあるハッシュとの距離を見て「似ているかどうか」判定
-        is_dup = False
-        for existing in hashes:
-            if h - existing <= DUP_HASH_THRESHOLD:
-                # 似すぎている＝重複と判断
-                is_dup = True
-                break
-
-        if not is_dup:
-            hashes.append(h)
-            unique_files.append(f)
-            kept_names.append(f.filename)
-
-        # このあとまた read() できるようにポインタを先頭に戻す
-        f.file.seek(0)
-
-    return unique_files, kept_names, all_names
+    job = supabase_insert_job(payload.dict())
+    return VolumeEstimateResponse(job=job)
 
 
-# ==========================
-# APIエンドポイント
-# ==========================
-
-@app.post("/v1/volume-estimate")
-async def volume_estimate(images: List[UploadFile] = File(...)):
-    """
-    立米AIエンドポイント（ダミー版）
-    - 画像を受け取る
-    - 重複画像をまとめて1枚扱いにする
-    - 仮の立米＆品目リストを返す
-    - 同時に「案件レコード」を作成して保存する
-    """
-
-    # 1. 重複画像を除外
-    deduped_images, kept_names, all_names = await deduplicate_images(images)
-
-    # 2. 案件ID = request_id
-    request_id = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
-    job_id = request_id
-    now_iso = datetime.utcnow().isoformat()
-
-    # 3. ダミーの立米結果（あとで本物ロジックに差し替え）
-    dummy_response = {
-        "request_id": request_id,
-        "job_id": job_id,
-        "total_volume_m3": 5.0,
-        "volume_detail": {
-            "base_volume_m3": 4.5,
-            "scene_volume_m3": 2.0,
-            "safety_factor": 1.10,
-            "rounded_rule": "0.5m3切り上げ",
-        },
-        "items": [
-            {
-                "category": "冷蔵庫",
-                "subtype": "2ドア",
-                "size_class": "中",
-                "quantity": 1,
-                "volume_per_item_m3": 0.6,
-                "volume_total_m3": 0.6,
-                "flags": ["家電リサイクル"],
-            },
-            {
-                "category": "マットレス",
-                "subtype": "シングル",
-                "size_class": "中",
-                "quantity": 1,
-                "volume_per_item_m3": 0.48,
-                "volume_total_m3": 0.48,
-                "flags": ["特処分"],
-            },
-        ],
-        "special_disposal": {
-            "recycle_items": ["冷蔵庫（2ドア）"],
-            "hard_disposal_items": ["マットレス（シングル）"],
-            "dangerous_items": [],
-        },
-        "warnings": [
-            "2階以上の大型家具が含まれる可能性があります。",
-            "マットレスは特処分品です。",
-        ],
-        "debug": {
-            "received_count": len(all_names),
-            "after_dedup_count": len(deduped_images),
-            "all_images": all_names,
-            "kept_images": kept_names,
-        },
-    }
-
-    # 4. 案件レコードを作成して保存
-    job_record = {
-        "job_id": job_id,
-        "job_name": "",
-        "created_at": now_iso,
-        "updated_at": now_iso,
-        "customer_name": "",
-        "address": "",
-        "work_date": "",
-        "work_time": "",
-        "price_total": None,
-        "truck_type": "",
-        "workers": None,
-        "notes": "",
-        "total_volume_m3": dummy_response["total_volume_m3"],
-        "ai_result": dummy_response,
-    }
-
-    jobs[job_id] = job_record
-    save_jobs_to_file()
-
-    return dummy_response
-
-
-@app.get("/v1/jobs")
+@app.get("/v1/jobs", response_model=List[Job])
 def list_jobs():
-    """
-    案件一覧を返す（営業用の履歴画面イメージ）
-    """
-    job_list = list(jobs.values())
-    job_list.sort(key=lambda j: j.get("created_at", ""), reverse=True)
-
-    summarized = []
-    for j in job_list:
-        summarized.append(
-            {
-                "job_id": j["job_id"],
-                "job_name": j.get("job_name", ""),
-                "created_at": j.get("created_at", ""),
-                "customer_name": j.get("customer_name", ""),
-                "address": j.get("address", ""),
-                "total_volume_m3": j.get("total_volume_m3", None),
-                "price_total": j.get("price_total", None),
-            }
-        )
-    return summarized
+    return supabase_select_jobs()
 
 
-@app.get("/v1/jobs/{job_id}")
+@app.get("/v1/jobs/{job_id}", response_model=Job)
 def get_job(job_id: str):
-    """
-    1件分の案件詳細を返す
-    """
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return supabase_select_job(job_id)
 
 
-@app.post("/v1/jobs/{job_id}")
+@app.post("/v1/jobs/{job_id}", response_model=Job)
 def update_job(job_id: str, payload: JobUpdate):
-    """
-    案件情報を更新する（営業が後から編集）
-    """
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    data = payload.dict(exclude_unset=True)
-    for k, v in data.items():
-        job[k] = v
-
-    job["updated_at"] = datetime.utcnow().isoformat()
-
-    jobs[job_id] = job
-    save_jobs_to_file()
-
-    return job
-
-
-# ==========================
-# 作業書PDF生成
-# ==========================
-
-def generate_worksheet_pdf(job: dict) -> BytesIO:
-    """
-    作業書PDFを1枚生成して BytesIO として返す。
-    A4縦 / シンプルなレイアウト。
-    """
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    margin_x = 40
-    y = height - 40
-
-    def draw_text(line, text, size=10):
-        nonlocal y
-        c.setFont(FONT_NAME, size)
-        c.drawString(margin_x, y, text)
-        y -= line
-
-    # タイトル
-    c.setFont(FONT_NAME, 16)
-    c.drawString(margin_x, y, "作業指示書")
-    y -= 30
-
-    # 案件基本情報
-    draw_text(16, f"案件ID：{job.get('job_id', '')}", 10)
-    draw_text(16, f"現場名：{job.get('job_name', '')}", 10)
-    draw_text(16, f"お客様名：{job.get('customer_name', '')}", 10)
-    draw_text(16, f"住所：{job.get('address', '')}", 10)
-    draw_text(16, f"作業日：{job.get('work_date', '')}", 10)
-    draw_text(16, f"作業時間帯：{job.get('work_time', '')}", 10)
-
-    price = job.get("price_total")
-    price_str = f"{int(price):,} 円（税込）" if price is not None else "-"
-    draw_text(16, f"見積金額：{price_str}", 10)
-
-    draw_text(16, f"トラック種別：{job.get('truck_type', '')}", 10)
-    workers = job.get("workers")
-    workers_str = f"{workers} 名" if workers is not None else "-"
-    draw_text(16, f"作業員人数：{workers_str}", 10)
-
-    y -= 10
-    c.line(margin_x, y, width - margin_x, y)
-    y -= 20
-
-    # 立米と品目（AI結果から）
-    ai = job.get("ai_result", {})
-    total_volume = ai.get("total_volume_m3")
-    total_volume_str = f"{total_volume} ㎥" if total_volume is not None else "-"
-
-    draw_text(16, f"想定立米：{total_volume_str}", 10)
-
-    y -= 10
-    c.setFont(FONT_NAME, 11)
-    c.drawString(margin_x, y, "品目一覧：")
-    y -= 18
-
-    items = ai.get("items") or []
-    if not items:
-        draw_text(14, "（品目情報なし）", 10)
-    else:
-        c.setFont(FONT_NAME, 9)
-        # 簡易テーブルヘッダ
-        headers = ["品目", "サブタイプ", "数量", "立米小計"]
-        col_x = [margin_x, margin_x + 160, margin_x + 300, margin_x + 360]
-        for i, h_txt in enumerate(headers):
-            c.drawString(col_x[i], y, h_txt)
-        y -= 14
-        c.line(margin_x, y + 4, width - margin_x, y + 4)
-        y -= 8
-
-        for it in items:
-            if y < 80:
-                c.showPage()
-                c.setFont(FONT_NAME, 9)
-                y = height - 60
-            c.drawString(col_x[0], y, str(it.get("category", "")))
-            c.drawString(col_x[1], y, str(it.get("subtype", "")))
-            c.drawString(col_x[2], y, str(it.get("quantity", "")))
-            c.drawString(col_x[3], y, str(it.get("volume_total_m3", "")))
-            y -= 14
-
-    # ---- 備考 ----
-    y -= 10
-    c.line(margin_x, y, width - margin_x, y)
-    y -= 20
-
-    notes = job.get("notes") or ""
-    draw_text(16, "備考：", 10)
-    if notes:
-        c.setFont(FONT_NAME, 10)
-        for line in notes.splitlines():
-            while line:
-                part = line[:40]
-                c.drawString(margin_x, y, part)
-                y -= 14
-                line = line[40:]
-                if y < 80:
-                    c.showPage()
-                    c.setFont(FONT_NAME, 10)
-                    y = height - 60
-    else:
-        draw_text(14, "（特記事項なし）", 10)
-
-    # サイン欄の前に、ページ下に寄りすぎていたら改ページ
-    if y < 120:
-        c.showPage()
-        y = height - 60
-
-    y -= 20
-    c.line(margin_x, y, width - margin_x, y)
-    y -= 20
-
-    # 確認サイン欄
-    draw_text(16, "お客様確認サイン：", 10)
-    # x, y, 幅, 高さ（少し幅を短くして安全側に）
-    c.rect(margin_x + 110, y + 4, 180, 40)
-
-    c.showPage()
-    c.save()
-    buffer.seek(0)
-    return buffer
+    return supabase_update_job(job_id, payload.dict(exclude_unset=True))
 
 
 @app.get("/v1/jobs/{job_id}/worksheet")
-def get_job_worksheet(job_id: str):
-    """
-    案件の作業書PDFを生成して返す
-    """
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+def job_pdf(job_id: str):
+    job = supabase_select_job(job_id)
+    raise HTTPException(501, "PDF ロジック未実装（既存PDF生成をここに貼り付け）")
 
-    pdf_bytes = generate_worksheet_pdf(job)
-    filename = f"worksheet_{job_id}.pdf"
 
-    return StreamingResponse(
-        pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
-    )
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
