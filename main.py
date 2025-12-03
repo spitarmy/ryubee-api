@@ -11,6 +11,13 @@ from PIL import Image
 import imagehash
 from io import BytesIO
 
+from starlette.responses import StreamingResponse
+
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 app = FastAPI()
 
 # CORS（フロントのRyu兵衛から叩けるようにする）
@@ -26,7 +33,7 @@ app.add_middleware(
 # 値が小さいほど厳しめ（5〜8あたりが現実的）
 DUP_HASH_THRESHOLD = 5
 
-# 案件データを保存するファイル名（超シンプルにJSONで）
+# 案件データを保存するファイル名（シンプルにJSONで）
 JOBS_FILE = "jobs.json"
 
 # メモリ上の案件データ（起動中ずっと保持）
@@ -57,19 +64,29 @@ def save_jobs_to_file():
 # 起動時に一度だけ読み込む
 load_jobs_from_file()
 
+# 日本語フォントの登録（文字化け防止）
+FONT_NAME = "JP"
+FONT_PATH = "fonts/ipaexg.ttf"
+
+try:
+    pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+except Exception:
+    # フォントが見つからない/読み込めない場合は英字フォントにフォールバック
+    FONT_NAME = "Helvetica"
+
 
 class JobUpdate(BaseModel):
     """ユーザーが後から編集できる項目だけを定義"""
 
-    job_name: Optional[str] = None        # 現場名（例：伏見区○○様 不用品回収）
+    job_name: Optional[str] = None        # 現場名
     customer_name: Optional[str] = None   # お客様名
     address: Optional[str] = None         # 住所
-    work_date: Optional[str] = None       # 作業日（文字列でOK：2025-12-10 など）
-    work_time: Optional[str] = None       # 作業時間帯（10:00-12:00 など）
+    work_date: Optional[str] = None       # 作業日
+    work_time: Optional[str] = None       # 作業時間帯
     price_total: Optional[float] = None   # 見積金額（税込）
-    truck_type: Optional[str] = None      # 使用トラック種別（2t / 3t など）
+    truck_type: Optional[str] = None      # 使用トラック種別
     workers: Optional[int] = None         # 作業員人数
-    notes: Optional[str] = None           # 備考（階段・EVなし・要養生など）
+    notes: Optional[str] = None           # 備考
 
 
 async def deduplicate_images(files: List[UploadFile]):
@@ -125,18 +142,18 @@ async def volume_estimate(images: List[UploadFile] = File(...)):
     - 同時に「案件レコード」を作成して保存する
     """
 
-    # ★ まず重複画像を除外
+    # 1. 重複画像を除外
     deduped_images, kept_names, all_names = await deduplicate_images(images)
 
-    # ★ 案件ID = request_id = 一意なID
+    # 2. 案件ID = request_id
     request_id = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job_id = request_id
     now_iso = datetime.utcnow().isoformat()
 
-    # ★ ダミーの立米結果（ここは後で本物ロジックに置き換える）
+    # 3. ダミーの立米結果（あとで本物ロジックに差し替え）
     dummy_response = {
         "request_id": request_id,
-        "job_id": job_id,  # フロントからもこのIDで案件をひけるように
+        "job_id": job_id,
         "total_volume_m3": 5.0,
         "volume_detail": {
             "base_volume_m3": 4.5,
@@ -174,17 +191,17 @@ async def volume_estimate(images: List[UploadFile] = File(...)):
             "マットレスは特処分品です。",
         ],
         "debug": {
-            "received_count": len(all_names),         # フロントから送られてきた枚数
-            "after_dedup_count": len(deduped_images), # 重複除外後に残った枚数
-            "all_images": all_names,                  # 全ファイル名
-            "kept_images": kept_names,                # 解析に使うファイル名
+            "received_count": len(all_names),
+            "after_dedup_count": len(deduped_images),
+            "all_images": all_names,
+            "kept_images": kept_names,
         },
     }
 
-    # ★ 案件レコードを作成して保存
+    # 4. 案件レコードを作成して保存
     job_record = {
         "job_id": job_id,
-        "job_name": "",          # ここはフロントからあとで編集してもらう
+        "job_name": "",
         "created_at": now_iso,
         "updated_at": now_iso,
         "customer_name": "",
@@ -196,7 +213,7 @@ async def volume_estimate(images: List[UploadFile] = File(...)):
         "workers": None,
         "notes": "",
         "total_volume_m3": dummy_response["total_volume_m3"],
-        "ai_result": dummy_response,  # 立米AIの結果をまるごと保持
+        "ai_result": dummy_response,
     }
 
     jobs[job_id] = job_record
@@ -209,12 +226,10 @@ async def volume_estimate(images: List[UploadFile] = File(...)):
 def list_jobs():
     """
     案件一覧を返す（営業用の履歴画面イメージ）
-    - 新しい順にソート
     """
     job_list = list(jobs.values())
     job_list.sort(key=lambda j: j.get("created_at", ""), reverse=True)
 
-    # 一覧では必要そうな項目だけ返す
     summarized = []
     for j in job_list:
         summarized.append(
@@ -235,7 +250,6 @@ def list_jobs():
 def get_job(job_id: str):
     """
     1件分の案件詳細を返す
-    - 立米AIの結果（ai_result）も含む
     """
     job = jobs.get(job_id)
     if not job:
@@ -247,9 +261,6 @@ def get_job(job_id: str):
 def update_job(job_id: str, payload: JobUpdate):
     """
     案件情報を更新する（営業が後から編集）
-    - 現場名
-    - お客様情報
-    - 金額 etc.
     """
     job = jobs.get(job_id)
     if not job:
@@ -265,3 +276,142 @@ def update_job(job_id: str, payload: JobUpdate):
     save_jobs_to_file()
 
     return job
+
+
+def generate_worksheet_pdf(job: dict) -> BytesIO:
+    """
+    作業書PDFを1枚生成して BytesIO として返す。
+    A4縦 / シンプルなレイアウト。
+    """
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    margin_x = 40
+    y = height - 40
+
+    def draw_text(line, text, size=10):
+        nonlocal y
+        c.setFont(FONT_NAME, size)
+        c.drawString(margin_x, y, text)
+        y -= line
+
+    # タイトル
+    c.setFont(FONT_NAME, 16)
+    c.drawString(margin_x, y, "作業指示書")
+    y -= 30
+
+    # 案件基本情報
+    draw_text(16, f"案件ID：{job.get('job_id', '')}", 10)
+    draw_text(16, f"現場名：{job.get('job_name', '')}", 10)
+    draw_text(16, f"お客様名：{job.get('customer_name', '')}", 10)
+    draw_text(16, f"住所：{job.get('address', '')}", 10)
+    draw_text(16, f"作業日：{job.get('work_date', '')}", 10)
+    draw_text(16, f"作業時間帯：{job.get('work_time', '')}", 10)
+
+    price = job.get("price_total")
+    price_str = f"{int(price):,} 円（税込）" if price is not None else "-"
+    draw_text(16, f"見積金額：{price_str}", 10)
+
+    draw_text(16, f"トラック種別：{job.get('truck_type', '')}", 10)
+    workers = job.get("workers")
+    workers_str = f"{workers} 名" if workers is not None else "-"
+    draw_text(16, f"作業員人数：{workers_str}", 10)
+
+    y -= 10
+    c.line(margin_x, y, width - margin_x, y)
+    y -= 20
+
+    # 立米と品目（AI結果から）
+    ai = job.get("ai_result", {})
+    total_volume = ai.get("total_volume_m3")
+    total_volume_str = f"{total_volume} ㎥" if total_volume is not None else "-"
+
+    draw_text(16, f"想定立米：{total_volume_str}", 10)
+
+    y -= 10
+    c.setFont(FONT_NAME, 11)
+    c.drawString(margin_x, y, "品目一覧：")
+    y -= 18
+
+    items = ai.get("items") or []
+    if not items:
+        draw_text(14, "（品目情報なし）", 10)
+    else:
+        c.setFont(FONT_NAME, 9)
+        # 簡易テーブルヘッダ
+        headers = ["品目", "サブタイプ", "数量", "立米小計"]
+        col_x = [margin_x, margin_x + 160, margin_x + 300, margin_x + 360]
+        for i, h_txt in enumerate(headers):
+            c.drawString(col_x[i], y, h_txt)
+        y -= 14
+        c.line(margin_x, y + 4, width - margin_x, y + 4)
+        y -= 8
+
+        for it in items:
+            if y < 80:
+                c.showPage()
+                c.setFont(FONT_NAME, 9)
+                y = height - 60
+            c.drawString(col_x[0], y, str(it.get("category", "")))
+            c.drawString(col_x[1], y, str(it.get("subtype", "")))
+            c.drawString(col_x[2], y, str(it.get("quantity", "")))
+            c.drawString(col_x[3], y, str(it.get("volume_total_m3", "")))
+            y -= 14
+
+    y -= 10
+    c.line(margin_x, y, width - margin_x, y)
+    y -= 20
+
+    # 備考
+    notes = job.get("notes") or ""
+    draw_text(16, "備考：", 10)
+    if notes:
+        # 行ごとにざっくり折り返し
+        c.setFont(FONT_NAME, 10)
+        max_width = width - margin_x * 2
+        for line in notes.splitlines():
+            # 単純に長さでカット（ざっくりでOK）
+            while line:
+                part = line[:40]
+                c.drawString(margin_x, y, part)
+                y -= 14
+                line = line[40:]
+                if y < 60:
+                    c.showPage()
+                    c.setFont(FONT_NAME, 10)
+                    y = height - 60
+    else:
+        draw_text(14, "（特記事項なし）", 10)
+
+    y -= 20
+    c.line(margin_x, y, width - margin_x, y)
+    y -= 20
+
+    # 確認サイン欄
+    draw_text(16, "お客様確認サイン：", 10)
+    c.rect(margin_x + 110, y + 4, 200, 40)  # サイン枠
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer
+
+
+@app.get("/v1/jobs/{job_id}/worksheet")
+def get_job_worksheet(job_id: str):
+    """
+    案件の作業書PDFを生成して返す
+    """
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    pdf_bytes = generate_worksheet_pdf(job)
+    filename = f"worksheet_{job_id}.pdf"
+
+    return StreamingResponse(
+        pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
