@@ -12,9 +12,8 @@ from pydantic import BaseModel, Field
 # ① ここに Supabase API を差し込む（.env から読む）
 # ==========================================================
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")  # https://cquygugcndkkvxxpsgwi.supabase.co
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNxdXlndWdjbmRra3Z4eHBzZ3dpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDc1NjY0NSwiZXhwIjoyMDgwMzMyNjQ1fQ.t5UNLecCHF6Q_GdB81s2tRLyyI4BufgLSNGF31el6ko
-
+SUPABASE_URL = os.getenv("SUPABASE_URL")  
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")   
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY が設定されていません (.env を確認してください)")
 
