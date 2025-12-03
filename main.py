@@ -20,7 +20,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-# CORS（フロントのRyu兵衛から叩けるようにする）
+# ==========================
+# CORS設定（フロントのRyu兵衛から叩けるように）
+# ==========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 慣れてきたら Vercel のドメインだけに絞ってOK
@@ -29,18 +31,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 「どれくらい似てたら同じ画像とみなすか」のしきい値（0〜64くらい）
-# 値が小さいほど厳しめ（5〜8あたりが現実的）
+# ==========================
+# 設定値など
+# ==========================
+
+# 画像の重複判定のしきい値（0〜64くらい）
 DUP_HASH_THRESHOLD = 5
 
-# 案件データを保存するファイル名（シンプルにJSONで）
+# 案件データを保存するファイル名（JSON）
 JOBS_FILE = "jobs.json"
 
 # メモリ上の案件データ（起動中ずっと保持）
-jobs = {}  # job_id -> dict
+# job_id -> dict
+jobs = {}
 
 
 def load_jobs_from_file():
+    """サーバー起動時に jobs.json から読み込む"""
     global jobs
     if os.path.exists(JOBS_FILE):
         try:
@@ -53,6 +60,7 @@ def load_jobs_from_file():
 
 
 def save_jobs_to_file():
+    """案件データを jobs.json に保存"""
     try:
         with open(JOBS_FILE, "w", encoding="utf-8") as f:
             json.dump(jobs, f, ensure_ascii=False, indent=2)
@@ -67,13 +75,12 @@ load_jobs_from_file()
 # ==========================
 # 日本語フォントの登録
 # ==========================
-# リポジトリ内の ipaexg.ttf を探して使う
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_NAME = "JP"
 
 FONT_CANDIDATES = [
-    os.path.join(BASE_DIR, "fonts", "ipaexg.ttf"),  # fonts/ipaexg.ttf に置いた場合
-    os.path.join(BASE_DIR, "ipaexg.ttf"),           # （保険）直下に置いた場合
+    os.path.join(BASE_DIR, "fonts", "ipaexg.ttf"),  # 通常はここ
+    os.path.join(BASE_DIR, "ipaexg.ttf"),           # 保険：直下に置いた場合
 ]
 
 font_path = None
@@ -91,6 +98,10 @@ if font_path is None:
 pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
 
 
+# ==========================
+# Pydantic モデル
+# ==========================
+
 class JobUpdate(BaseModel):
     """ユーザーが後から編集できる項目だけを定義"""
 
@@ -104,6 +115,10 @@ class JobUpdate(BaseModel):
     workers: Optional[int] = None         # 作業員人数
     notes: Optional[str] = None           # 備考
 
+
+# ==========================
+# 画像の重複判定（角度違いをまとめる）
+# ==========================
 
 async def deduplicate_images(files: List[UploadFile]):
     """
@@ -147,6 +162,10 @@ async def deduplicate_images(files: List[UploadFile]):
 
     return unique_files, kept_names, all_names
 
+
+# ==========================
+# APIエンドポイント
+# ==========================
 
 @app.post("/v1/volume-estimate")
 async def volume_estimate(images: List[UploadFile] = File(...)):
@@ -294,13 +313,17 @@ def update_job(job_id: str, payload: JobUpdate):
     return job
 
 
+# ==========================
+# 作業書PDF生成
+# ==========================
+
 def generate_worksheet_pdf(job: dict) -> BytesIO:
     """
     作業書PDFを1枚生成して BytesIO として返す。
     A4縦 / シンプルなレイアウト。
     """
     buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesizes=A4)
+    c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
     margin_x = 40
@@ -338,7 +361,7 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
     c.line(margin_x, y, width - margin_x, y)
     y -= 20
 
-    # 立米と品目
+    # 立米と品目（AI結果から）
     ai = job.get("ai_result", {})
     total_volume = ai.get("total_volume_m3")
     total_volume_str = f"{total_volume} ㎥" if total_volume is not None else "-"
@@ -355,6 +378,7 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
         draw_text(14, "（品目情報なし）", 10)
     else:
         c.setFont(FONT_NAME, 9)
+        # 簡易テーブルヘッダ
         headers = ["品目", "サブタイプ", "数量", "立米小計"]
         col_x = [margin_x, margin_x + 160, margin_x + 300, margin_x + 360]
         for i, h_txt in enumerate(headers):
@@ -374,28 +398,32 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
             c.drawString(col_x[3], y, str(it.get("volume_total_m3", "")))
             y -= 14
 
+    # ---- 備考 ----
     y -= 10
     c.line(margin_x, y, width - margin_x, y)
     y -= 20
 
-    # 備考
     notes = job.get("notes") or ""
     draw_text(16, "備考：", 10)
     if notes:
         c.setFont(FONT_NAME, 10)
-        max_width = width - margin_x * 2
         for line in notes.splitlines():
             while line:
                 part = line[:40]
                 c.drawString(margin_x, y, part)
                 y -= 14
                 line = line[40:]
-                if y < 60:
+                if y < 80:
                     c.showPage()
                     c.setFont(FONT_NAME, 10)
                     y = height - 60
     else:
         draw_text(14, "（特記事項なし）", 10)
+
+    # サイン欄の前に、ページ下に寄りすぎていたら改ページ
+    if y < 120:
+        c.showPage()
+        y = height - 60
 
     y -= 20
     c.line(margin_x, y, width - margin_x, y)
@@ -403,7 +431,8 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
 
     # 確認サイン欄
     draw_text(16, "お客様確認サイン：", 10)
-    c.rect(margin_x + 110, y + 4, 200, 40)
+    # x, y, 幅, 高さ（少し幅を短くして安全側に）
+    c.rect(margin_x + 110, y + 4, 180, 40)
 
     c.showPage()
     c.save()
