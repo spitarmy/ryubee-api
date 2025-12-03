@@ -64,15 +64,31 @@ def save_jobs_to_file():
 # 起動時に一度だけ読み込む
 load_jobs_from_file()
 
-# 日本語フォントの登録（文字化け防止）
+# ==========================
+# 日本語フォントの登録
+# ==========================
+# リポジトリ内の ipaexg.ttf を探して使う
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_NAME = "JP"
-FONT_PATH = "fonts/ipaexg.ttf"
 
-try:
-    pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
-except Exception:
-    # フォントが見つからない/読み込めない場合は英字フォントにフォールバック
-    FONT_NAME = "Helvetica"
+FONT_CANDIDATES = [
+    os.path.join(BASE_DIR, "fonts", "ipaexg.ttf"),  # fonts/ipaexg.ttf に置いた場合
+    os.path.join(BASE_DIR, "ipaexg.ttf"),           # （保険）直下に置いた場合
+]
+
+font_path = None
+for p in FONT_CANDIDATES:
+    if os.path.exists(p):
+        font_path = p
+        break
+
+if font_path is None:
+    # ここで止まってくれた方が「フォントが無い！」とすぐ気づける
+    raise RuntimeError(
+        "ipaexg.ttf が見つかりません。リポジトリ直下か fonts/ フォルダに配置してください。"
+    )
+
+pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
 
 
 class JobUpdate(BaseModel):
@@ -284,7 +300,7 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
     A4縦 / シンプルなレイアウト。
     """
     buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
+    c = canvas.Canvas(buffer, pagesizes=A4)
     width, height = A4
 
     margin_x = 40
@@ -322,7 +338,7 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
     c.line(margin_x, y, width - margin_x, y)
     y -= 20
 
-    # 立米と品目（AI結果から）
+    # 立米と品目
     ai = job.get("ai_result", {})
     total_volume = ai.get("total_volume_m3")
     total_volume_str = f"{total_volume} ㎥" if total_volume is not None else "-"
@@ -339,7 +355,6 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
         draw_text(14, "（品目情報なし）", 10)
     else:
         c.setFont(FONT_NAME, 9)
-        # 簡易テーブルヘッダ
         headers = ["品目", "サブタイプ", "数量", "立米小計"]
         col_x = [margin_x, margin_x + 160, margin_x + 300, margin_x + 360]
         for i, h_txt in enumerate(headers):
@@ -367,11 +382,9 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
     notes = job.get("notes") or ""
     draw_text(16, "備考：", 10)
     if notes:
-        # 行ごとにざっくり折り返し
         c.setFont(FONT_NAME, 10)
         max_width = width - margin_x * 2
         for line in notes.splitlines():
-            # 単純に長さでカット（ざっくりでOK）
             while line:
                 part = line[:40]
                 c.drawString(margin_x, y, part)
@@ -390,7 +403,7 @@ def generate_worksheet_pdf(job: dict) -> BytesIO:
 
     # 確認サイン欄
     draw_text(16, "お客様確認サイン：", 10)
-    c.rect(margin_x + 110, y + 4, 200, 40)  # サイン枠
+    c.rect(margin_x + 110, y + 4, 200, 40)
 
     c.showPage()
     c.save()
