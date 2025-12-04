@@ -7,17 +7,25 @@ import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv  # ← .env を読むために追加
+
+# .env を読み込む
+load_dotenv()
 
 # ==========================================================
-# ① ここに Supabase API を差し込む（.env から読む）
+# ① Supabase API 設定（.env から読み込み）
 # ==========================================================
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")  
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")   
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY が設定されていません (.env を確認してください)")
+    raise RuntimeError(
+        "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY が設定されていません (.env を確認してください)"
+    )
 
-def supabase_headers():
+
+def supabase_headers() -> dict:
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -25,7 +33,8 @@ def supabase_headers():
         "Prefer": "return=representation",
     }
 
-def supabase_table_url(table: str):
+
+def supabase_table_url(table: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{table}"
 
 
@@ -68,6 +77,7 @@ class JobUpdate(BaseModel):
 
 
 class VolumeEstimateRequest(JobBase):
+    """立米AI用のリクエスト。今は JobBase と同じ構造。"""
     pass
 
 
@@ -80,11 +90,11 @@ class VolumeEstimateResponse(BaseModel):
 # ③ FastAPI 初期化
 # ==========================================================
 
-app = FastAPI()
+app = FastAPI(title="Ryubee API (Supabase version)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 本番で必要ならドメインを絞る
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -96,6 +106,7 @@ app.add_middleware(
 
 TABLE = "jobs"
 
+
 def supabase_insert_job(data: dict) -> Job:
     url = supabase_table_url(TABLE)
     now = datetime.utcnow().isoformat()
@@ -104,7 +115,7 @@ def supabase_insert_job(data: dict) -> Job:
         "job_id": data.get("job_id", str(uuid.uuid4())),
         "created_at": now,
         "updated_at": now,
-        **data
+        **data,
     }]
 
     res = requests.post(url, headers=supabase_headers(), json=payload)
@@ -157,6 +168,11 @@ def supabase_update_job(job_id: str, data: dict) -> Job:
 # ⑤ API エンドポイント
 # ==========================================================
 
+@app.get("/v1/health")
+def health_check():
+    return {"status": "ok"}
+
+
 @app.post("/v1/volume-estimate", response_model=VolumeEstimateResponse)
 def create_and_estimate(payload: VolumeEstimateRequest):
     """
@@ -166,6 +182,8 @@ def create_and_estimate(payload: VolumeEstimateRequest):
     - price_total
     - ai_result
     """
+    # TODO: OpenAI を呼び出して total_volume_m3 / price_total / ai_result を計算する処理をここに入れる
+
     job = supabase_insert_job(payload.dict())
     return VolumeEstimateResponse(job=job)
 
@@ -187,10 +205,12 @@ def update_job(job_id: str, payload: JobUpdate):
 
 @app.get("/v1/jobs/{job_id}/worksheet")
 def job_pdf(job_id: str):
+    # ここで job を取得して PDF を生成する
     job = supabase_select_job(job_id)
+    # TODO: 既存の PDF 生成ロジックをここに移植
     raise HTTPException(501, "PDF ロジック未実装（既存PDF生成をここに貼り付け）")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
